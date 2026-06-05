@@ -1,25 +1,45 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "vpn_anonymizer"
 version = "0.1.0"
 description = "Cycle through Mullvad WireGuard relays and reputation-check exit IPs — for staying in touch with loved ones during periods of internet censorship."
+readme = "README.md"
+requires-python = ">=3.10"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
-dependencies = []
+authors = [{ name = "John Pratt", email = "john@john-pratt.com" }]
 keywords = ["vpn", "mullvad", "censorship", "wireguard", "privacy", "anonymity"]
 classifiers = [
-    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
     "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
     "Topic :: Internet",
     "Topic :: Security",
+    "Topic :: System :: Networking",
 ]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/jpratt9/vpn-anonymizer"
+Repository = "https://github.com/jpratt9/vpn-anonymizer"
+Issues = "https://github.com/jpratt9/vpn-anonymizer/issues"
 
 [project.scripts]
 vpn-anonymizer = "vpn_anonymizer:main"
 
 [tool.setuptools]
 py-modules = ["vpn_anonymizer"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["."]
+python_files = ["test_*.py"]
