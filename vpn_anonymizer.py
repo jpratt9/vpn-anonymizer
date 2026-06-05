@@ -17,9 +17,9 @@ import time
 
 
 def list_relays():
-    """All Mullvad WireGuard relay IDs from `mullvad relay list` (e.g. us-nyc-wg-001)."""
+    """US Mullvad WireGuard relay IDs from `mullvad relay list` (e.g. us-nyc-wg-001)."""
     out = subprocess.run(["mullvad", "relay", "list"], capture_output=True, text=True, timeout=15).stdout
-    return re.findall(r"\b([a-z]{2}-[a-z]+-wg-\d+)\b", out)
+    return re.findall(r"\b(us-[a-z]+-wg-\d+)\b", out)
 
 
 def connect_to_server(server_id, connect_timeout=40):
@@ -58,7 +58,7 @@ def disconnect():
         return False
 
 
-def detection_flags(api="https://api.ipapi.is/", fields=("is_vpn", "is_datacenter", "is_proxy")):
+def detection_flags(api="https://api.ipapi.is/", fields=("is_vpn", "is_proxy")):
     """Check the CURRENT (tunneled) exit IP's reputation. Returns (ip, {field: bool})."""
     raw = subprocess.run(["curl", "-s", api], capture_output=True, text=True, timeout=20).stdout
     data = json.loads(raw)
@@ -88,7 +88,9 @@ def main():
         if hits:
             print(f"  {server} ({ip}) DETECTED! → {', '.join(hits)}", flush=True)
         else:
-            print(f"  {server} ({ip}) clean ✓", flush=True)
+            print(f"  {server} ({ip}) clean ✓ — staying connected here, done.", flush=True)
+            return
+    print("No clean relay found.", flush=True)
     disconnect()
 
 

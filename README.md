@@ -1,8 +1,9 @@
 # VPN Anonymizer
 
-Cycles through every Mullvad WireGuard relay, connects to each, ping-verifies the
-connection, and checks whether that exit IP is flagged as **VPN / datacenter / proxy**
-(via [api.ipapi.is](https://ipapi.is)) — so you can see which relays come up clean.
+Cycles through US Mullvad WireGuard relays, connects to each, ping-verifies the
+connection, and checks whether that exit IP is flagged as **VPN / proxy**
+(via [api.ipapi.is](https://ipapi.is)). It stops at the first clean relay and stays
+connected to it.
 
 Connect / ping-verify / disconnect logic is reused from `clip_fixer`'s `scraper/vpn.py`.
 
@@ -17,19 +18,18 @@ Connect / ping-verify / disconnect logic is reused from `clip_fixer`'s `scraper/
 python3 vpn_anonymizer.py
 ```
 
-No arguments. It enumerates all relays and works through them in order, logging
-each result. It will churn your network connection as it hops servers, and there
-are hundreds of relays, so **Ctrl-C** once you've found enough clean ones.
+No arguments. It enumerates the US relays and works through them in order, logging
+each result, and **stops at the first clean one** (leaving the VPN connected to it).
 
 ## Output
 
 ```
-Found 723 relays.
+Found 210 relays.
 
 Checking us-nyc-wg-001 ...
-  us-nyc-wg-001 (185.213.155.66) DETECTED! → is_vpn, is_datacenter
+  us-nyc-wg-001 (185.213.155.66) DETECTED! → is_vpn
 Checking us-nyc-wg-002 ...
   us-nyc-wg-002 no connectivity (ping failed) → next
-Checking se-got-wg-004 ...
-  se-got-wg-004 (193.138.7.x) clean ✓
+Checking us-lax-wg-204 ...
+  us-lax-wg-204 (198.54.x.x) clean ✓ — staying connected here, done.
 ```
