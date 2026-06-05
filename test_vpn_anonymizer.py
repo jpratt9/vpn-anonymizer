@@ -76,5 +76,40 @@ class TestMainStopOnClean(unittest.TestCase):
         disconnect.assert_called_once()           # exhausted -> tear down
 
 
+class TestRotate(unittest.TestCase):
+    def test_returns_relay_id_when_clean_found(self):
+        with mock.patch.object(va, "list_relays", return_value=["us-a-wg-1"]), \
+             mock.patch.object(va, "connect_to_server", return_value=True), \
+             mock.patch.object(va, "verify_connection", return_value=True), \
+             mock.patch.object(va, "detection_flags", return_value=("1.1.1.1", {"is_vpn": False, "is_proxy": False})), \
+             mock.patch.object(va, "disconnect") as disconnect:
+            result = va.rotate()
+        self.assertEqual(result, "us-a-wg-1")
+        disconnect.assert_not_called()
+
+    def test_returns_none_when_all_flagged_and_disconnects(self):
+        with mock.patch.object(va, "list_relays", return_value=["us-a-wg-1", "us-b-wg-2"]), \
+             mock.patch.object(va, "connect_to_server", return_value=True), \
+             mock.patch.object(va, "verify_connection", return_value=True), \
+             mock.patch.object(va, "detection_flags", return_value=("1.1.1.1", {"is_vpn": True, "is_proxy": False})), \
+             mock.patch.object(va, "disconnect") as disconnect:
+            result = va.rotate()
+        self.assertIsNone(result)
+        disconnect.assert_called_once()
+
+    def test_skip_excludes_relays(self):
+        seen = []
+        def fake_connect(server):
+            seen.append(server)
+            return True
+        with mock.patch.object(va, "list_relays", return_value=["us-a-wg-1", "us-b-wg-2", "us-c-wg-3"]), \
+             mock.patch.object(va, "connect_to_server", side_effect=fake_connect), \
+             mock.patch.object(va, "verify_connection", return_value=True), \
+             mock.patch.object(va, "detection_flags", return_value=("1.1.1.1", {"is_vpn": False, "is_proxy": False})), \
+             mock.patch.object(va, "disconnect"):
+            va.rotate(skip={"us-a-wg-1", "us-b-wg-2"})
+        self.assertEqual(seen, ["us-c-wg-3"])  # only the un-skipped one was tried
+
+
 if __name__ == "__main__":
     unittest.main()

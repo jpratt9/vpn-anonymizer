@@ -4,16 +4,25 @@ whether that exit IP is flagged as VPN / datacenter / proxy (via api.ipapi.is).
 
 Connect/verify/disconnect logic is lifted from clip_fixer's scraper/vpn.py.
 Requires: the `mullvad` CLI installed, the daemon running, and an account
-logged in. Takes no arguments — it loops through every WireGuard relay until
-you Ctrl-C.
+logged in.
 
+Public API:
+    from vpn_anonymizer import rotate
+    rotate(skip=None) -> str | None   # new relay id, or None if none worked
+
+CLI:
+    vpn-anonymizer        # walks every WireGuard relay until one is clean
     python3 vpn_anonymizer.py
 """
 import json
+import logging
+import random
 import re
 import subprocess
 import sys
 import time
+
+logger = logging.getLogger(__name__)
 
 
 def list_relays():
@@ -65,33 +74,47 @@ def detection_flags(api="https://api.ipapi.is/", fields=("is_vpn", "is_proxy")):
     return data.get("ip", "?"), {f: bool(data.get(f, False)) for f in fields}
 
 
-def main():
-    relays = list_relays()
-    if not relays:
-        sys.exit("No relays found — is the mullvad CLI installed and the daemon running?")
-    print(f"Found {len(relays)} relays.\n", flush=True)
+def rotate(skip=None):
+    """Walk the US WireGuard relays in random order (skipping any in `skip`) and
+    stop at the first one that connects + verifies + isn't flagged by ipapi.is.
+    Returns the new relay id on success, or None if every candidate failed.
+
+    On None, the tunnel is left torn down (disconnect() called)."""
+    skip = set(skip) if skip else set()
+    relays = [r for r in list_relays() if r not in skip]
+    random.shuffle(relays)
     for server in relays:
-        print(f"Checking {server} ...", flush=True)
+        logger.info("Checking %s ...", server)
         if not connect_to_server(server):
-            print(f"  {server} connect failed → next", flush=True)
+            logger.info("  %s connect failed → next", server)
             continue
         if not verify_connection():
-            print(f"  {server} no connectivity (ping failed) → next", flush=True)
+            logger.info("  %s no connectivity (ping failed) → next", server)
             disconnect()
             continue
         try:
             ip, flags = detection_flags()
         except Exception as exc:
-            print(f"  {server} detection error ({exc}) → next", flush=True)
+            logger.info("  %s detection error (%s) → next", server, exc)
             continue
         hits = [name for name, flagged in flags.items() if flagged]
         if hits:
-            print(f"  {server} ({ip}) DETECTED! → {', '.join(hits)}", flush=True)
-        else:
-            print(f"  {server} ({ip}) clean ✓ — staying connected here, done.", flush=True)
-            return
-    print("No clean relay found.", flush=True)
+            logger.info("  %s (%s) DETECTED! → %s", server, ip, ", ".join(hits))
+            continue
+        logger.info("  %s (%s) clean ✓ — staying connected here, done.", server, ip)
+        return server
     disconnect()
+    return None
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    relays = list_relays()
+    if not relays:
+        sys.exit("No relays found — is the mullvad CLI installed and the daemon running?")
+    print(f"Found {len(relays)} relays.\n", flush=True)
+    if rotate() is None:
+        print("No clean relay found.", flush=True)
 
 
 if __name__ == "__main__":
