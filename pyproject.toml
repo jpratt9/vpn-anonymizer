@@ -5,9 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vpn_anonymizer"
 version = "0.1.0"
-description = "Cycle through Mullvad WireGuard relays and reputation-check exit IPs."
+description = "Cycle through Mullvad WireGuard relays and reputation-check exit IPs — for staying in touch with loved ones during periods of internet censorship."
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = []
+keywords = ["vpn", "mullvad", "censorship", "wireguard", "privacy", "anonymity"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX",
+    "Topic :: Internet",
+    "Topic :: Security",
+]
 
 [project.scripts]
 vpn-anonymizer = "vpn_anonymizer:main"
