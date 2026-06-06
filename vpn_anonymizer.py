@@ -14,6 +14,7 @@ CLI:
     vpn-anonymizer        # walks every WireGuard relay until one is clean
     python3 vpn_anonymizer.py
 """
+import argparse
 import concurrent.futures
 import json
 import logging
@@ -71,19 +72,50 @@ def list_relays_with_ips(country="us"):
 def ping_ip(ip, timeout=_PREFILTER_PING_TIMEOUT_S):
     """Send one ICMP packet to `ip` (no VPN tunnel involved — this runs against
     the relay's public IP from the host's regular network path). Returns the
-    measured RTT in ms, or None on timeout/error/unreachable."""
+    measured RTT in ms, or None on timeout/error/unreachable.
+
+    NB: ping's wait-for-reply flag has different UNITS per platform:
+      - Windows  `-w N` = milliseconds
+      - macOS    `-W N` = MILLISECONDS  (BSD ping)
+      - Linux    `-W N` = seconds       (iputils ping; integer only)
+    Treating macOS as Linux makes -W 2 mean "2 ms" → every reply arrives "out
+    of wait time" and ping prints no per-packet line → regex returns None.
+    """
+    timeout_ms = int(timeout * 1000)
     if sys.platform == "win32":
-        cmd = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), ip]
+        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
+    elif sys.platform == "darwin":
+        cmd = ["ping", "-c", "1", "-W", str(timeout_ms), ip]
     else:
-        cmd = ["ping", "-c", "1", "-W", str(int(timeout)), ip]
+        cmd = ["ping", "-c", "1", "-W", str(max(1, int(timeout))), ip]
+    logger.debug("ping_ip(%s): exec %s", ip, " ".join(cmd))
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 1)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        logger.debug("ping_ip(%s): subprocess TIMED OUT after %.1fs", ip, timeout + 1)
         return None
+    logger.debug("ping_ip(%s): rc=%d", ip, r.returncode)
+    logger.debug("ping_ip(%s): stdout=%r", ip, r.stdout)
+    if r.stderr:
+        logger.debug("ping_ip(%s): stderr=%r", ip, r.stderr)
     if r.returncode != 0:
+        logger.debug("ping_ip(%s): nonzero returncode → returning None", ip)
         return None
+    # Prefer per-packet "time=X ms"; fall back to "round-trip ... = min/avg/.../"
+    # summary (BSD ping prints stats even when a late reply was "out of wait
+    # time" and never got a per-packet line).
     m = re.search(r"time[=<]\s*([\d.]+)\s*ms", r.stdout)
-    return float(m.group(1)) if m else None
+    if m:
+        ms = float(m.group(1))
+        logger.debug("ping_ip(%s): matched per-packet time=%.1fms", ip, ms)
+        return ms
+    m = re.search(r"min/avg/max(?:/stddev)?\s*=\s*[\d.]+/([\d.]+)/", r.stdout)
+    if m:
+        ms = float(m.group(1))
+        logger.debug("ping_ip(%s): no per-packet line; matched summary avg=%.1fms", ip, ms)
+        return ms
+    logger.debug("ping_ip(%s): no time/summary regex match in stdout → returning None", ip)
+    return None
 
 
 def ping_relays(
@@ -173,16 +205,21 @@ def _parse_ping_stats(output):
     return avg_ms, loss_pct
 
 
-def verify_connection():
-    """Ping google.com through the tunnel to confirm the relay is (a) reachable,
+def verify_connection(host="google.com"):
+    """Ping `host` through the tunnel to confirm the relay is (a) reachable,
     (b) reasonably fast (avg RTT <= _MAX_AVG_LATENCY_MS), and (c) not dropping
     packets (loss <= _MAX_PACKET_LOSS_PCT). Returns True iff all three hold.
     The numbers actually measured get logged so a caller can see why a relay
-    was rejected. (Extends clip_fixer's binary-pass/fail check with parsing.)"""
+    was rejected. (Extends clip_fixer's binary-pass/fail check with parsing.)
+
+    `host` defaults to google.com (generic reachability test) but callers can
+    override to verify against the actual target site (e.g. musescore.com) —
+    so the chosen relay is one that REACHES YOUR TARGET, not just one with
+    generic internet."""
     if sys.platform == "win32":
-        cmd = ["ping", "-n", str(_PING_COUNT), "-w", "5000", "google.com"]
+        cmd = ["ping", "-n", str(_PING_COUNT), "-w", "5000", host]
     else:
-        cmd = ["ping", "-c", str(_PING_COUNT), "-W", "5", "google.com"]
+        cmd = ["ping", "-c", str(_PING_COUNT), "-W", "5", host]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=_PING_COUNT * 5)
     except subprocess.TimeoutExpired:
@@ -222,17 +259,23 @@ def detection_flags(api="https://api.ipapi.is/", fields=("is_vpn", "is_proxy")):
     return data.get("ip", "?"), {f: bool(data.get(f, False)) for f in fields}
 
 
-def rotate(skip=None, country="us"):
+def rotate(skip=None, country="us", verify_host="google.com"):
     """Walk the WireGuard relays for `country` (default 'us', pass None for any),
     skipping any in `skip`, and stop at the first one that connects + verifies
-    + isn't flagged by ipapi.is. Returns the new relay id on success, or None
-    if every candidate failed.
+    against `verify_host` + isn't flagged by ipapi.is. Returns the new relay id
+    on success, or None if every candidate failed.
 
     Candidates are pre-pinged from outside the tunnel in parallel and walked in
     ascending-latency order — relays that don't respond or exceed
     _PREFILTER_MAX_LATENCY_MS are skipped entirely. This avoids spending 20-40s
     per relay on connect-and-verify just to discover the underlying RTT is too
-    high.
+    high. If 0 relays respond to ICMP (likely outbound ping blocked), we fall
+    back to attempting all relays in random order — the WireGuard handshake
+    does not use ICMP, so connect can still succeed.
+
+    `verify_host` is the in-tunnel ping target used to confirm the relay
+    actually works. Default google.com = generic reachability; override with
+    e.g. 'musescore.com' to pick relays that reach your actual workload.
 
     On None, the tunnel is left torn down (disconnect() called)."""
     skip = set(skip) if skip else set()
@@ -241,15 +284,27 @@ def rotate(skip=None, country="us"):
         return None
     logger.info("Pre-pinging %d candidate relay(s) ...", len(relays_w_ips))
     sorted_relays = ping_relays(relays_w_ips)
-    logger.info("  %d viable after ping filter (max %.0fms), walking in ascending-latency order",
-                len(sorted_relays), _PREFILTER_MAX_LATENCY_MS)
+    if not sorted_relays:
+        # ICMP-to-relay-IPs is blocked somewhere (ISP, CGNAT, Mullvad-side
+        # rate-limit). Don't give up — the WireGuard handshake doesn't use
+        # ICMP, so the connect attempt may still succeed. Walk all candidates
+        # in randomized order with NaN as the "unpinged" sentinel.
+        logger.warning("  0 relays responded to ICMP (likely outbound ping blocked) — "
+                       "falling back to unfiltered list in random order")
+        random.shuffle(relays_w_ips)
+        sorted_relays = [(rid, ip, float("nan")) for rid, ip in relays_w_ips]
+    else:
+        logger.info("  %d viable after ping filter (max %.0fms), walking in ascending-latency order",
+                    len(sorted_relays), _PREFILTER_MAX_LATENCY_MS)
     for server, _ip, pre_ms in sorted_relays:
-        logger.info("Checking %s (pre-ping %.0fms) ...", server, pre_ms)
+        pre_label = f"{pre_ms:.0f}ms" if pre_ms == pre_ms else "unpinged"
+        logger.info("Checking %s (pre-ping %s) ...", server, pre_label)
         if not connect_to_server(server):
             logger.info("  %s connect failed → next", server)
             continue
-        if not verify_connection():
-            logger.info("  %s no connectivity (ping failed) → next", server)
+        if not verify_connection(host=verify_host):
+            logger.info("  %s no connectivity to %s (ping failed) → next",
+                        server, verify_host)
             disconnect()
             continue
         try:
@@ -268,12 +323,28 @@ def rotate(skip=None, country="us"):
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    relays = list_relays()
+    p = argparse.ArgumentParser(prog="vpn-anonymizer")
+    p.add_argument("-d", "--debug", action="store_true",
+                   help="show per-relay ping latency + drop reasons (DEBUG level)")
+    p.add_argument("--country", default="us",
+                   help="2-letter ISO country code to scan (default us; pass empty for any)")
+    p.add_argument("--ping", metavar="HOST", default="google.com",
+                   help="host to ping THROUGH the tunnel as the relay verify check. "
+                        "Default google.com (generic reachability). Override with your "
+                        "actual workload target (e.g. musescore.com) so relays that "
+                        "reach google but not your target get rejected.")
+    args = p.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(message)s",
+    )
+
+    relays = list_relays(country=args.country or None)
     if not relays:
         sys.exit("No relays found — is the mullvad CLI installed and the daemon running?")
     print(f"Found {len(relays)} relays.\n", flush=True)
-    if rotate() is None:
+    if rotate(country=args.country or None, verify_host=args.ping) is None:
         print("No clean relay found.", flush=True)
 
 

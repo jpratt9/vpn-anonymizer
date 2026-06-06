@@ -1,6 +1,7 @@
 """Unit tests for vpn_anonymizer. All subprocess (mullvad CLI + curl) calls are
 mocked — nothing real is contacted and no VPN connection is made."""
 import json
+import sys
 import unittest
 from unittest import mock
 
@@ -158,6 +159,15 @@ def _mock_ping_sort(*relays_w_ips):
 
 
 class TestMainStopOnClean(unittest.TestCase):
+    # main() now uses argparse — patch sys.argv to the bare program name so
+    # pytest's own command-line args don't leak into ArgumentParser.parse_args.
+    def setUp(self):
+        self._argv_patch = mock.patch.object(sys, "argv", ["vpn-anonymizer"])
+        self._argv_patch.start()
+
+    def tearDown(self):
+        self._argv_patch.stop()
+
     def test_stops_at_first_clean_and_stays_connected(self):
         with mock.patch.object(va, "list_relays", return_value=["us-a-wg-1", "us-b-wg-2", "us-c-wg-3"]), \
              mock.patch.object(va, "list_relays_with_ips", return_value=[
@@ -272,19 +282,37 @@ class TestRotate(unittest.TestCase):
             va.rotate(country=None)
         lr.assert_called_once_with(country=None)
 
-    def test_returns_none_when_ping_filter_drops_everything(self):
-        # Every relay either times out (None latency) or exceeds the threshold —
-        # ping_relays returns empty, rotate should return None without
-        # attempting any connect_to_server calls.
+    def test_falls_back_to_all_relays_when_ping_filter_drops_everything(self):
+        # When ping_relays returns empty (ISP/CGNAT blocks outbound ICMP, or
+        # Mullvad relays block ICMP), rotate should NOT give up — WireGuard
+        # handshake doesn't use ICMP, so connect can still succeed. We fall
+        # back to attempting every relay in randomized order.
         with mock.patch.object(va, "list_relays_with_ips", return_value=[
                  ("us-a-wg-1", "1.1.1.1"), ("us-b-wg-2", "2.2.2.2"),
              ]), \
              mock.patch.object(va, "ping_relays", return_value=[]), \
-             mock.patch.object(va, "connect_to_server") as connect, \
+             mock.patch.object(va, "connect_to_server", return_value=True) as connect, \
+             mock.patch.object(va, "verify_connection", return_value=True), \
+             mock.patch.object(va, "detection_flags",
+                               return_value=("1.1.1.1", {"is_vpn": False, "is_proxy": False})), \
+             mock.patch.object(va, "disconnect") as disconnect:
+            result = va.rotate()
+        # First fallback relay was attempted and accepted.
+        self.assertIn(result, {"us-a-wg-1", "us-b-wg-2"})
+        connect.assert_called()  # attempted at least one relay
+        disconnect.assert_not_called()  # stayed connected to the winner
+
+    def test_returns_none_when_fallback_relays_also_all_fail(self):
+        # Now the real "give up" path: ping filter drops everything AND every
+        # fallback attempt also fails to connect.
+        with mock.patch.object(va, "list_relays_with_ips", return_value=[
+                 ("us-a-wg-1", "1.1.1.1"), ("us-b-wg-2", "2.2.2.2"),
+             ]), \
+             mock.patch.object(va, "ping_relays", return_value=[]), \
+             mock.patch.object(va, "connect_to_server", return_value=False), \
              mock.patch.object(va, "disconnect") as disconnect:
             result = va.rotate()
         self.assertIsNone(result)
-        connect.assert_not_called()
         disconnect.assert_called_once()
 
 
@@ -323,6 +351,111 @@ class TestPingIp(unittest.TestCase):
         with mock.patch.object(va.subprocess, "run",
                                side_effect=_sub.TimeoutExpired(cmd="ping", timeout=2)):
             self.assertIsNone(va.ping_ip("1.1.1.1"))
+
+    def test_macos_uses_milliseconds_for_W_flag(self):
+        # Regression: macOS BSD ping `-W` is MILLISECONDS, not seconds.
+        # `ping -W 2` on darwin = 2ms wait → every relay times out. The fix is
+        # to multiply timeout-seconds by 1000 on darwin.
+        macos_out = ("PING 1.1.1.1 (1.1.1.1): 56 data bytes\n"
+                     "64 bytes from 1.1.1.1: icmp_seq=0 ttl=58 time=5.0 ms\n")
+        with mock.patch.object(va.sys, "platform", "darwin"), \
+             mock.patch.object(va.subprocess, "run",
+                               return_value=fake_proc(stdout=macos_out)) as run:
+            va.ping_ip("1.1.1.1", timeout=2.0)
+            cmd = run.call_args.args[0]
+        # Command should include "-W 2000" (ms), NOT "-W 2" (which on darwin = 2ms)
+        self.assertIn("-W", cmd)
+        w_value = cmd[cmd.index("-W") + 1]
+        self.assertEqual(w_value, "2000")
+
+    def test_linux_uses_seconds_for_W_flag(self):
+        # On Linux, iputils ping `-W` is integer SECONDS — should be the
+        # plain timeout-int, not ms.
+        out = ("PING 1.1.1.1 (1.1.1.1): 56 data bytes\n"
+               "64 bytes from 1.1.1.1: icmp_seq=0 ttl=58 time=5.0 ms\n")
+        with mock.patch.object(va.sys, "platform", "linux"), \
+             mock.patch.object(va.subprocess, "run",
+                               return_value=fake_proc(stdout=out)) as run:
+            va.ping_ip("1.1.1.1", timeout=2.0)
+            cmd = run.call_args.args[0]
+        self.assertIn("-W", cmd)
+        w_value = cmd[cmd.index("-W") + 1]
+        self.assertEqual(w_value, "2")  # 2 seconds, not ms
+
+    def test_falls_back_to_summary_when_no_per_packet_line(self):
+        # Regression: BSD ping with a tight `-W` can omit the per-packet
+        # "time=X ms" line (reply arrived "out of wait time") but still
+        # populate the round-trip summary. ping_ip should accept the latter.
+        summary_only = ("PING 1.1.1.1 (1.1.1.1): 56 data bytes\n\n"
+                        "--- 1.1.1.1 ping statistics ---\n"
+                        "1 packets transmitted, 1 packets received, "
+                        "1 packets out of wait time\n"
+                        "round-trip min/avg/max/stddev = "
+                        "90.132/90.132/90.132/nan ms\n")
+        with mock.patch.object(va.subprocess, "run",
+                               return_value=fake_proc(stdout=summary_only)):
+            self.assertEqual(va.ping_ip("1.1.1.1"), 90.132)
+
+
+class TestVerifyConnectionHost(unittest.TestCase):
+    def test_default_host_is_google_dot_com(self):
+        out = ("PING google.com (1.1.1.1): 56 data bytes\n"
+               "round-trip min/avg/max/stddev = 5.0/5.0/5.0/0.0 ms\n"
+               "5 packets transmitted, 5 packets received, 0.0% packet loss\n")
+        with mock.patch.object(va.subprocess, "run",
+                               return_value=fake_proc(stdout=out)) as run:
+            va.verify_connection()
+            cmd = run.call_args.args[0]
+        self.assertEqual(cmd[-1], "google.com")
+
+    def test_custom_host_threaded_into_ping_command(self):
+        # The --ping HOST CLI override sets verify_host so the in-tunnel ping
+        # targets the actual workload host (e.g. musescore.com) instead of
+        # google.com. Verify the host arg reaches the ping subprocess.
+        out = ("PING musescore.com (1.1.1.1): 56 data bytes\n"
+               "round-trip min/avg/max/stddev = 5.0/5.0/5.0/0.0 ms\n"
+               "5 packets transmitted, 5 packets received, 0.0% packet loss\n")
+        with mock.patch.object(va.subprocess, "run",
+                               return_value=fake_proc(stdout=out)) as run:
+            va.verify_connection(host="musescore.com")
+            cmd = run.call_args.args[0]
+        self.assertEqual(cmd[-1], "musescore.com")
+
+
+class TestRotateVerifyHost(unittest.TestCase):
+    def test_verify_host_plumbed_through_to_verify_connection(self):
+        captured = {}
+        def fake_verify(host="google.com"):
+            captured["host"] = host
+            return True
+        with mock.patch.object(va, "list_relays_with_ips",
+                               return_value=[("us-a-wg-1", "1.1.1.1")]), \
+             mock.patch.object(va, "ping_relays",
+                               return_value=_mock_ping_sort(("us-a-wg-1", "1.1.1.1"))), \
+             mock.patch.object(va, "connect_to_server", return_value=True), \
+             mock.patch.object(va, "verify_connection", side_effect=fake_verify), \
+             mock.patch.object(va, "detection_flags",
+                               return_value=("1.1.1.1", {"is_vpn": False, "is_proxy": False})), \
+             mock.patch.object(va, "disconnect"):
+            va.rotate(verify_host="musescore.com")
+        self.assertEqual(captured["host"], "musescore.com")
+
+    def test_default_verify_host_is_google_dot_com(self):
+        captured = {}
+        def fake_verify(host="google.com"):
+            captured["host"] = host
+            return True
+        with mock.patch.object(va, "list_relays_with_ips",
+                               return_value=[("us-a-wg-1", "1.1.1.1")]), \
+             mock.patch.object(va, "ping_relays",
+                               return_value=_mock_ping_sort(("us-a-wg-1", "1.1.1.1"))), \
+             mock.patch.object(va, "connect_to_server", return_value=True), \
+             mock.patch.object(va, "verify_connection", side_effect=fake_verify), \
+             mock.patch.object(va, "detection_flags",
+                               return_value=("1.1.1.1", {"is_vpn": False, "is_proxy": False})), \
+             mock.patch.object(va, "disconnect"):
+            va.rotate()
+        self.assertEqual(captured["host"], "google.com")
 
 
 class TestPingRelays(unittest.TestCase):
