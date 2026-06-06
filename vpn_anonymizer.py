@@ -102,6 +102,7 @@ def ping_relays(
     if not relays_with_ips:
         return []
     results = []
+    dropped = []  # (rid, ip, reason) for DEBUG-level visibility into rejections
     with concurrent.futures.ThreadPoolExecutor(max_workers=parallelism) as ex:
         future_to_relay = {
             ex.submit(ping_ip, ip, timeout): (rid, ip) for rid, ip in relays_with_ips
@@ -110,12 +111,22 @@ def ping_relays(
             rid, ip = future_to_relay[fut]
             try:
                 ms = fut.result()
-            except Exception:
+            except Exception as exc:
                 ms = None
+                reason = f"ping error: {exc}"
+            else:
+                reason = "no response (timeout/unreachable)" if ms is None \
+                         else f"latency {ms:.1f}ms exceeds {max_latency_ms}ms threshold" \
+                              if ms > max_latency_ms else None
             if ms is None or ms > max_latency_ms:
+                logger.debug("  ping: %s (%s) DROPPED — %s", rid, ip, reason)
+                dropped.append((rid, ip, reason))
                 continue
+            logger.debug("  ping: %s (%s) = %.1fms", rid, ip, ms)
             results.append((rid, ip, ms))
     results.sort(key=lambda t: t[2])
+    logger.debug("  ping summary: %d viable, %d dropped (of %d total)",
+                 len(results), len(dropped), len(relays_with_ips))
     return results
 
 
