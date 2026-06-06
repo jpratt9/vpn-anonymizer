@@ -14,6 +14,7 @@ CLI:
     vpn-anonymizer        # walks every WireGuard relay until one is clean
     python3 vpn_anonymizer.py
 """
+import concurrent.futures
 import json
 import logging
 import random
@@ -31,6 +32,17 @@ _PING_COUNT = 5             # packets to send (need >2 for meaningful stats)
 _MAX_AVG_LATENCY_MS = 200   # reject relays whose average RTT exceeds this
 _MAX_PACKET_LOSS_PCT = 20   # reject relays losing more than this fraction
 
+# Pre-connect ping filter — used by rotate() to sort relays by latency BEFORE
+# attempting the expensive connect/verify/detect cycle. A single ICMP ping to
+# each relay's public IP from outside the tunnel; ~1-2s for 60+ relays in
+# parallel vs. 20-40s per relay for connect/verify.
+_PREFILTER_PING_TIMEOUT_S = 2.0          # per-relay ICMP timeout
+_PREFILTER_PARALLELISM = 64              # concurrent ICMP probes
+_PREFILTER_MAX_LATENCY_MS = 400          # drop relays whose pre-connect RTT
+                                          # exceeds this (deliberately looser
+                                          # than the post-connect 200ms threshold
+                                          # — tunnel overhead adds ~30-80ms)
+
 
 def list_relays(country="us"):
     """Mullvad WireGuard relay IDs from `mullvad relay list` (e.g. us-nyc-wg-001).
@@ -39,6 +51,68 @@ def list_relays(country="us"):
     pattern = r"\b([a-z]{2}-[a-z]+-wg-\d+)\b" if country is None \
               else rf"\b({re.escape(country)}-[a-z]+-wg-\d+)\b"
     return re.findall(pattern, out)
+
+
+def list_relays_with_ips(country="us"):
+    """Same as list_relays() but returns [(relay_id, public_ip), ...]. Pulls the
+    IP from the `(ip)` token right after each relay id in `mullvad relay list`
+    output, e.g. `us-nyc-wg-001 (185.213.155.66) - WireGuard`. Used by the
+    pre-connect ping pre-filter."""
+    out = subprocess.run(["mullvad", "relay", "list"], capture_output=True, text=True, timeout=15).stdout
+    cc = r"[a-z]{2}" if country is None else re.escape(country)
+    pattern = rf"\b({cc}-[a-z]+-wg-\d+)\s*\(([\d.]+)\)\s*-\s*WireGuard"
+    return re.findall(pattern, out)
+
+
+def ping_ip(ip, timeout=_PREFILTER_PING_TIMEOUT_S):
+    """Send one ICMP packet to `ip` (no VPN tunnel involved — this runs against
+    the relay's public IP from the host's regular network path). Returns the
+    measured RTT in ms, or None on timeout/error/unreachable."""
+    if sys.platform == "win32":
+        cmd = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), ip]
+    else:
+        cmd = ["ping", "-c", "1", "-W", str(int(timeout)), ip]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 1)
+    except subprocess.TimeoutExpired:
+        return None
+    if r.returncode != 0:
+        return None
+    m = re.search(r"time[=<]\s*([\d.]+)\s*ms", r.stdout)
+    return float(m.group(1)) if m else None
+
+
+def ping_relays(
+    relays_with_ips,
+    *,
+    parallelism=_PREFILTER_PARALLELISM,
+    max_latency_ms=_PREFILTER_MAX_LATENCY_MS,
+    timeout=_PREFILTER_PING_TIMEOUT_S,
+):
+    """Concurrently ping every (relay_id, ip) pair and return them sorted by
+    latency ASC. Relays that timed out, errored, or exceeded `max_latency_ms`
+    are excluded — the returned list contains only viable candidates.
+
+    Cuts rotation wall-time hugely: a single batched ICMP round is ~1-2s for
+    60+ relays vs. ~20-40s per relay if you connect-and-verify in serial."""
+    if not relays_with_ips:
+        return []
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallelism) as ex:
+        future_to_relay = {
+            ex.submit(ping_ip, ip, timeout): (rid, ip) for rid, ip in relays_with_ips
+        }
+        for fut in concurrent.futures.as_completed(future_to_relay):
+            rid, ip = future_to_relay[fut]
+            try:
+                ms = fut.result()
+            except Exception:
+                ms = None
+            if ms is None or ms > max_latency_ms:
+                continue
+            results.append((rid, ip, ms))
+    results.sort(key=lambda t: t[2])
+    return results
 
 
 def connect_to_server(server_id, connect_timeout=40):
@@ -134,17 +208,28 @@ def detection_flags(api="https://api.ipapi.is/", fields=("is_vpn", "is_proxy")):
 
 
 def rotate(skip=None, country="us"):
-    """Walk the WireGuard relays for `country` (default 'us', pass None for any)
-    in random order (skipping any in `skip`) and stop at the first one that
-    connects + verifies + isn't flagged by ipapi.is. Returns the new relay id
-    on success, or None if every candidate failed.
+    """Walk the WireGuard relays for `country` (default 'us', pass None for any),
+    skipping any in `skip`, and stop at the first one that connects + verifies
+    + isn't flagged by ipapi.is. Returns the new relay id on success, or None
+    if every candidate failed.
+
+    Candidates are pre-pinged from outside the tunnel in parallel and walked in
+    ascending-latency order — relays that don't respond or exceed
+    _PREFILTER_MAX_LATENCY_MS are skipped entirely. This avoids spending 20-40s
+    per relay on connect-and-verify just to discover the underlying RTT is too
+    high.
 
     On None, the tunnel is left torn down (disconnect() called)."""
     skip = set(skip) if skip else set()
-    relays = [r for r in list_relays(country=country) if r not in skip]
-    random.shuffle(relays)
-    for server in relays:
-        logger.info("Checking %s ...", server)
+    relays_w_ips = [(r, ip) for r, ip in list_relays_with_ips(country=country) if r not in skip]
+    if not relays_w_ips:
+        return None
+    logger.info("Pre-pinging %d candidate relay(s) ...", len(relays_w_ips))
+    sorted_relays = ping_relays(relays_w_ips)
+    logger.info("  %d viable after ping filter (max %.0fms), walking in ascending-latency order",
+                len(sorted_relays), _PREFILTER_MAX_LATENCY_MS)
+    for server, _ip, pre_ms in sorted_relays:
+        logger.info("Checking %s (pre-ping %.0fms) ...", server, pre_ms)
         if not connect_to_server(server):
             logger.info("  %s connect failed → next", server)
             continue
