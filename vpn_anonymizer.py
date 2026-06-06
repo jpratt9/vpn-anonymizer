@@ -25,10 +25,13 @@ import time
 logger = logging.getLogger(__name__)
 
 
-def list_relays():
-    """US Mullvad WireGuard relay IDs from `mullvad relay list` (e.g. us-nyc-wg-001)."""
+def list_relays(country="us"):
+    """Mullvad WireGuard relay IDs from `mullvad relay list` (e.g. us-nyc-wg-001).
+    `country` is the 2-letter ISO prefix; pass None to return every country."""
     out = subprocess.run(["mullvad", "relay", "list"], capture_output=True, text=True, timeout=15).stdout
-    return re.findall(r"\b(us-[a-z]+-wg-\d+)\b", out)
+    pattern = r"\b([a-z]{2}-[a-z]+-wg-\d+)\b" if country is None \
+              else rf"\b({re.escape(country)}-[a-z]+-wg-\d+)\b"
+    return re.findall(pattern, out)
 
 
 def connect_to_server(server_id, connect_timeout=40):
@@ -74,14 +77,15 @@ def detection_flags(api="https://api.ipapi.is/", fields=("is_vpn", "is_proxy")):
     return data.get("ip", "?"), {f: bool(data.get(f, False)) for f in fields}
 
 
-def rotate(skip=None):
-    """Walk the US WireGuard relays in random order (skipping any in `skip`) and
-    stop at the first one that connects + verifies + isn't flagged by ipapi.is.
-    Returns the new relay id on success, or None if every candidate failed.
+def rotate(skip=None, country="us"):
+    """Walk the WireGuard relays for `country` (default 'us', pass None for any)
+    in random order (skipping any in `skip`) and stop at the first one that
+    connects + verifies + isn't flagged by ipapi.is. Returns the new relay id
+    on success, or None if every candidate failed.
 
     On None, the tunnel is left torn down (disconnect() called)."""
     skip = set(skip) if skip else set()
-    relays = [r for r in list_relays() if r not in skip]
+    relays = [r for r in list_relays(country=country) if r not in skip]
     random.shuffle(relays)
     for server in relays:
         logger.info("Checking %s ...", server)

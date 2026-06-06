@@ -34,6 +34,17 @@ class TestListRelays(unittest.TestCase):
                 ["us-nyc-wg-001", "us-nyc-wg-002", "us-lax-wg-201"],
             )  # excludes OpenVPN and non-US relays
 
+    def test_explicit_country_filter(self):
+        with mock.patch.object(va.subprocess, "run", return_value=fake_proc(stdout=RELAY_LIST)):
+            self.assertEqual(va.list_relays(country="se"), ["se-got-wg-001"])
+
+    def test_country_none_returns_all_wireguard_relays(self):
+        with mock.patch.object(va.subprocess, "run", return_value=fake_proc(stdout=RELAY_LIST)):
+            self.assertEqual(
+                va.list_relays(country=None),
+                ["us-nyc-wg-001", "us-nyc-wg-002", "us-lax-wg-201", "se-got-wg-001"],
+            )
+
 
 class TestDetectionFlags(unittest.TestCase):
     def test_excludes_datacenter_keeps_vpn_and_proxy(self):
@@ -109,6 +120,12 @@ class TestRotate(unittest.TestCase):
              mock.patch.object(va, "disconnect"):
             va.rotate(skip={"us-a-wg-1", "us-b-wg-2"})
         self.assertEqual(seen, ["us-c-wg-3"])  # only the un-skipped one was tried
+
+    def test_country_kwarg_passed_through_to_list_relays(self):
+        with mock.patch.object(va, "list_relays", return_value=[]) as lr, \
+             mock.patch.object(va, "disconnect"):
+            va.rotate(country=None)
+        lr.assert_called_once_with(country=None)
 
 
 if __name__ == "__main__":
