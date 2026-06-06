@@ -46,6 +46,96 @@ class TestListRelays(unittest.TestCase):
             )
 
 
+_MACOS_PING_OK = """\
+PING google.com (142.250.31.139): 56 data bytes
+64 bytes from 142.250.31.139: icmp_seq=0 ttl=109 time=12.345 ms
+64 bytes from 142.250.31.139: icmp_seq=1 ttl=109 time=11.234 ms
+64 bytes from 142.250.31.139: icmp_seq=2 ttl=109 time=13.111 ms
+64 bytes from 142.250.31.139: icmp_seq=3 ttl=109 time=12.000 ms
+64 bytes from 142.250.31.139: icmp_seq=4 ttl=109 time=11.500 ms
+
+--- google.com ping statistics ---
+5 packets transmitted, 5 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 11.234/12.038/13.111/0.620 ms
+"""
+
+_MACOS_PING_SLOW = _MACOS_PING_OK.replace(
+    "round-trip min/avg/max/stddev = 11.234/12.038/13.111/0.620 ms",
+    "round-trip min/avg/max/stddev = 250.000/350.500/450.000/80.000 ms",
+)
+_MACOS_PING_LOSSY = """\
+PING google.com (142.250.31.139): 56 data bytes
+64 bytes from 142.250.31.139: icmp_seq=0 ttl=109 time=12.345 ms
+
+--- google.com ping statistics ---
+5 packets transmitted, 1 packets received, 80.0% packet loss
+round-trip min/avg/max/stddev = 12.345/12.345/12.345/0.000 ms
+"""
+_WIN_PING_OK = """\
+Pinging google.com [142.250.31.139] with 32 bytes of data:
+Reply from 142.250.31.139: bytes=32 time=15ms TTL=109
+
+Ping statistics for 142.250.31.139:
+    Packets: Sent = 5, Received = 5, Lost = 0 (0% loss),
+Approximate round trip times in milli-seconds:
+    Minimum = 12ms, Maximum = 18ms, Average = 14ms
+"""
+
+
+class TestParsePingStats(unittest.TestCase):
+    def test_macos_clean(self):
+        self.assertEqual(va._parse_ping_stats(_MACOS_PING_OK), (12.038, 0.0))
+
+    def test_macos_lossy(self):
+        avg, loss = va._parse_ping_stats(_MACOS_PING_LOSSY)
+        self.assertAlmostEqual(avg, 12.345, places=2)
+        self.assertEqual(loss, 80.0)
+
+    def test_windows_format(self):
+        self.assertEqual(va._parse_ping_stats(_WIN_PING_OK), (14.0, 0.0))
+
+    def test_unparseable_returns_nones(self):
+        self.assertEqual(va._parse_ping_stats("garbage"), (None, None))
+
+
+class TestVerifyConnection(unittest.TestCase):
+    def _patch_run(self, stdout, returncode=0):
+        return mock.patch.object(
+            va.subprocess, "run",
+            return_value=fake_proc(stdout=stdout, returncode=returncode),
+        )
+
+    def test_fast_clean_relay_accepted(self):
+        with self._patch_run(_MACOS_PING_OK):
+            self.assertTrue(va.verify_connection())
+
+    def test_high_latency_rejected(self):
+        with self._patch_run(_MACOS_PING_SLOW):
+            self.assertFalse(va.verify_connection())  # 350ms > 200ms threshold
+
+    def test_high_packet_loss_rejected(self):
+        with self._patch_run(_MACOS_PING_LOSSY):
+            self.assertFalse(va.verify_connection())  # 80% > 20% threshold
+
+    def test_nonzero_returncode_rejected_without_parsing(self):
+        with self._patch_run("", returncode=1):
+            self.assertFalse(va.verify_connection())
+
+    def test_ping_subprocess_timeout_rejected(self):
+        import subprocess as _sub
+        with mock.patch.object(
+            va.subprocess, "run",
+            side_effect=_sub.TimeoutExpired(cmd="ping", timeout=25),
+        ):
+            self.assertFalse(va.verify_connection())
+
+    def test_unparseable_output_still_accepted_when_returncode_zero(self):
+        # If ping exits 0 but the summary line is missing (truncated output, etc.)
+        # we fall back to trusting the exit code — same as the old behavior.
+        with self._patch_run("garbage output"):
+            self.assertTrue(va.verify_connection())
+
+
 class TestDetectionFlags(unittest.TestCase):
     def test_excludes_datacenter_keeps_vpn_and_proxy(self):
         payload = json.dumps({"ip": "1.2.3.4", "is_vpn": True, "is_datacenter": True, "is_proxy": False})

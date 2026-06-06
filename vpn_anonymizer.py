@@ -24,6 +24,13 @@ import time
 
 logger = logging.getLogger(__name__)
 
+# Quality thresholds for verify_connection(). A relay that pings but with high
+# RTT or packet loss is technically reachable but useless for any real workload
+# — reject it and try the next one.
+_PING_COUNT = 5             # packets to send (need >2 for meaningful stats)
+_MAX_AVG_LATENCY_MS = 200   # reject relays whose average RTT exceeds this
+_MAX_PACKET_LOSS_PCT = 20   # reject relays losing more than this fraction
+
 
 def list_relays(country="us"):
     """Mullvad WireGuard relay IDs from `mullvad relay list` (e.g. us-nyc-wg-001).
@@ -50,14 +57,63 @@ def connect_to_server(server_id, connect_timeout=40):
     return False
 
 
+def _parse_ping_stats(output):
+    """Pull (avg_latency_ms, packet_loss_pct) out of ping(8) summary output.
+    Returns (None, None) for any field that couldn't be parsed.
+
+    macOS/Linux: "round-trip min/avg/max/stddev = 11.234/11.789/12.345/0.555 ms"
+                 "5 packets transmitted, 5 packets received, 0.0% packet loss"
+    Windows:     "Minimum = Xms, Maximum = Yms, Average = Zms"
+                 "Lost = N (P% loss)"
+    """
+    avg_ms = None
+    loss_pct = None
+
+    m = re.search(r"min/avg/max(?:/stddev)? = [\d.]+/([\d.]+)/", output)
+    if m:
+        avg_ms = float(m.group(1))
+    else:
+        m = re.search(r"Average\s*=\s*(\d+)\s*ms", output)
+        if m:
+            avg_ms = float(m.group(1))
+
+    m = re.search(r"([\d.]+)%\s*(?:packet\s*)?loss", output)
+    if m:
+        loss_pct = float(m.group(1))
+
+    return avg_ms, loss_pct
+
+
 def verify_connection():
-    """Ping google.com through the tunnel to confirm connectivity. (clip_fixer vpn.py)"""
-    cmd = (["ping", "-n", "2", "-w", "5000", "google.com"] if sys.platform == "win32"
-           else ["ping", "-c", "2", "-W", "5", "google.com"])
+    """Ping google.com through the tunnel to confirm the relay is (a) reachable,
+    (b) reasonably fast (avg RTT <= _MAX_AVG_LATENCY_MS), and (c) not dropping
+    packets (loss <= _MAX_PACKET_LOSS_PCT). Returns True iff all three hold.
+    The numbers actually measured get logged so a caller can see why a relay
+    was rejected. (Extends clip_fixer's binary-pass/fail check with parsing.)"""
+    if sys.platform == "win32":
+        cmd = ["ping", "-n", str(_PING_COUNT), "-w", "5000", "google.com"]
+    else:
+        cmd = ["ping", "-c", str(_PING_COUNT), "-W", "5", "google.com"]
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=10).returncode == 0
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_PING_COUNT * 5)
     except subprocess.TimeoutExpired:
+        logger.info("  ping subprocess timed out")
         return False
+    if result.returncode != 0:
+        return False
+    avg_ms, loss_pct = _parse_ping_stats(result.stdout)
+    logger.info("  ping: avg=%s ms, loss=%s%%",
+                f"{avg_ms:.1f}" if avg_ms is not None else "?",
+                f"{loss_pct:.1f}" if loss_pct is not None else "?")
+    if avg_ms is not None and avg_ms > _MAX_AVG_LATENCY_MS:
+        logger.info("  rejecting: avg latency %.1fms > %dms threshold",
+                    avg_ms, _MAX_AVG_LATENCY_MS)
+        return False
+    if loss_pct is not None and loss_pct > _MAX_PACKET_LOSS_PCT:
+        logger.info("  rejecting: packet loss %.1f%% > %d%% threshold",
+                    loss_pct, _MAX_PACKET_LOSS_PCT)
+        return False
+    return True
 
 
 def disconnect():

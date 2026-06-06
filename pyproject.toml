@@ -43,3 +43,7 @@ py-modules = ["vpn_anonymizer"]
 pythonpath = ["."]
 testpaths = ["."]
 python_files = ["test_*.py"]
+# seleniumbase auto-loads its pytest plugin globally if installed in the same
+# venv; it adds many seconds of startup overhead and blocks pytest-timeout.
+# Disable it — this project never touches a browser.
+addopts = "-p no:seleniumbase"
