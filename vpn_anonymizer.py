@@ -55,12 +55,16 @@ def list_relays(country="us"):
 
 def list_relays_with_ips(country="us"):
     """Same as list_relays() but returns [(relay_id, public_ip), ...]. Pulls the
-    IP from the `(ip)` token right after each relay id in `mullvad relay list`
-    output, e.g. `us-nyc-wg-001 (185.213.155.66) - WireGuard`. Used by the
-    pre-connect ping pre-filter."""
+    IPv4 out of the `(ip[, ipv6...])` token right after each relay id in
+    `mullvad relay list` output, e.g. `us-nyc-wg-001 (185.213.155.66)` or
+    `us-nyc-wg-001 (185.213.155.66, 2001:db8::1)`. Used by the pre-connect ping
+    pre-filter."""
     out = subprocess.run(["mullvad", "relay", "list"], capture_output=True, text=True, timeout=15).stdout
     cc = r"[a-z]{2}" if country is None else re.escape(country)
-    pattern = rf"\b({cc}-[a-z]+-wg-\d+)\s*\(([\d.]+)\)\s*-\s*WireGuard"
+    # Match the relay id then look for the FIRST IPv4 inside the parenthesized
+    # IP block. Lenient about anything else inside the parens (extra IPv6,
+    # whitespace, commas, etc.) and anything that comes after.
+    pattern = rf"\b({cc}-[a-z]+-wg-\d+)\s*\(\s*(\d+\.\d+\.\d+\.\d+)"
     return re.findall(pattern, out)
 
 

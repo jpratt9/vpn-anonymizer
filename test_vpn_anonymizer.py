@@ -11,18 +11,23 @@ def fake_proc(stdout="", returncode=0):
     return mock.Mock(stdout=stdout, returncode=returncode)
 
 
-# A trimmed `mullvad relay list` sample: US WireGuard, US OpenVPN, and a non-US relay.
+# A trimmed `mullvad relay list` sample copied from the actual mullvad CLI
+# output format (as of 2026-06): WireGuard relays show both IPv4 and IPv6 in
+# the parens, followed by " - WireGuard, hosted by <provider> (rented)".
+# OpenVPN relays use the same shape with " - OpenVPN" instead. This fixture
+# exists EXACTLY to prevent regressions where the regex is written against an
+# imagined format instead of the real one.
 RELAY_LIST = """\
 USA (us)
-\tNew York City, NY (nyc)
-\t\tus-nyc-wg-001 (185.213.155.66) - WireGuard
-\t\tus-nyc-wg-002 (185.213.155.67) - WireGuard
-\t\tus-nyc-ovpn-001 (185.213.155.68) - OpenVPN
-\tLos Angeles, CA (lax)
-\t\tus-lax-wg-201 (198.54.0.1) - WireGuard
+\tNew York City, NY (nyc) @ 40.71427°N, -74.00597°W
+\t\tus-nyc-wg-001 (185.213.155.66, 2a04:27c0:0:c::f001) - WireGuard, hosted by iRegister (rented)
+\t\tus-nyc-wg-002 (185.213.155.67, 2a04:27c0:0:d::f001) - WireGuard, hosted by iRegister (rented)
+\t\tus-nyc-ovpn-001 (185.213.155.68) - OpenVPN, hosted by iRegister (rented)
+\tLos Angeles, CA (lax) @ 34.05223°N, -118.24368°W
+\t\tus-lax-wg-201 (198.54.0.1, 2a04:27c0:0:e::f001) - WireGuard, hosted by DataPacket (rented)
 Sweden (se)
-\tGothenburg (got)
-\t\tse-got-wg-001 (193.138.7.1) - WireGuard
+\tGothenburg (got) @ 57.70887°N, 11.97456°W
+\t\tse-got-wg-001 (193.138.7.1, 2a03:1b20:1:f011::a01f) - WireGuard, hosted by Mullvad (rented)
 """
 
 
