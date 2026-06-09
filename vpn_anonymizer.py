@@ -43,10 +43,17 @@ _MAX_PACKET_LOSS_PCT = 20   # reject relays losing more than this fraction
 # parallel vs. 20-40s per relay for connect/verify.
 _PREFILTER_PING_TIMEOUT_S = 2.0          # per-relay ICMP timeout
 _PREFILTER_PARALLELISM = 64              # concurrent ICMP probes
-_PREFILTER_MAX_LATENCY_MS = 400          # drop relays whose pre-connect RTT
-                                          # exceeds this (deliberately looser
-                                          # than the post-connect 200ms threshold
-                                          # — tunnel overhead adds ~30-80ms)
+_PREFILTER_MAX_LATENCY_MS = 700          # drop relays whose pre-connect RTT
+                                          # exceeds this. Deliberately loose: we
+                                          # walk viable relays in RANDOM order
+                                          # (not nearest-first), so we WANT
+                                          # distant relays in the pool — always
+                                          # picking the lowest-latency exit would
+                                          # loosely triangulate our real location
+                                          # and make the rotation pattern
+                                          # predictable. The post-connect verify
+                                          # ceiling (200ms wired / 350ms Wi-Fi)
+                                          # still gates actual in-tunnel speed.
 
 
 def list_relays(country="us"):
@@ -345,13 +352,14 @@ def rotate(skip=None, country="us", verify_host="google.com"):
     against `verify_host` + isn't flagged by ipapi.is. Returns the new relay id
     on success, or None if every candidate failed.
 
-    Candidates are pre-pinged from outside the tunnel in parallel and walked in
-    ascending-latency order — relays that don't respond or exceed
-    _PREFILTER_MAX_LATENCY_MS are skipped entirely. This avoids spending 20-40s
-    per relay on connect-and-verify just to discover the underlying RTT is too
-    high. If 0 relays respond to ICMP (likely outbound ping blocked), we fall
-    back to attempting all relays in random order — the WireGuard handshake
-    does not use ICMP, so connect can still succeed.
+    Candidates are pre-pinged from outside the tunnel in parallel, then walked
+    in RANDOM order — relays that don't respond or exceed _PREFILTER_MAX_LATENCY_MS
+    are skipped entirely. The pre-ping is only a viability/latency-ceiling filter;
+    we deliberately do NOT walk nearest-first, because always picking the
+    lowest-latency exit loosely triangulates our real location and makes the
+    rotation pattern predictable. If 0 relays respond to ICMP (likely outbound
+    ping blocked), we fall back to attempting all relays in random order — the
+    WireGuard handshake does not use ICMP, so connect can still succeed.
 
     `verify_host` is the in-tunnel ping target used to confirm the relay
     actually works. Default google.com = generic reachability; override with
@@ -374,7 +382,12 @@ def rotate(skip=None, country="us", verify_host="google.com"):
         random.shuffle(relays_w_ips)
         sorted_relays = [(rid, ip, float("nan")) for rid, ip in relays_w_ips]
     else:
-        logger.info("  %d viable after ping filter (max %.0fms), walking in ascending-latency order",
+        # Walk viable relays in RANDOM order, NOT ascending latency. Always
+        # connecting to the nearest (lowest-RTT) exit would loosely triangulate
+        # our real location and give the rotation a predictable signature; a
+        # random walk over all relays under the (loose) ceiling breaks both.
+        random.shuffle(sorted_relays)
+        logger.info("  %d viable after ping filter (max %.0fms), walking in RANDOM order",
                     len(sorted_relays), _PREFILTER_MAX_LATENCY_MS)
     for server, _ip, pre_ms in sorted_relays:
         pre_label = f"{pre_ms:.0f}ms" if pre_ms == pre_ms else "unpinged"

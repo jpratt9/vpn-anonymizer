@@ -268,25 +268,34 @@ class TestMainStopOnClean(unittest.TestCase):
         self._argv_patch.stop()
 
     def test_stops_at_first_clean_and_stays_connected(self):
-        with mock.patch.object(va, "list_relays", return_value=["us-a-wg-1", "us-b-wg-2", "us-c-wg-3"]), \
-             mock.patch.object(va, "list_relays_with_ips", return_value=[
-                 ("us-a-wg-1", "1.1.1.1"), ("us-b-wg-2", "2.2.2.2"), ("us-c-wg-3", "3.3.3.3"),
-             ]), \
-             mock.patch.object(va, "ping_relays", return_value=_mock_ping_sort(
-                 ("us-a-wg-1", "1.1.1.1"), ("us-b-wg-2", "2.2.2.2"), ("us-c-wg-3", "3.3.3.3"),
-             )), \
-             mock.patch.object(va, "connect_to_server", return_value=True) as connect, \
+        # Walk order is now randomized, so key "clean vs flagged" off the
+        # actually-connected relay (not call order): exactly one relay is clean
+        # and rotate must settle on it and stop, whenever in the shuffle it's hit.
+        relays = [("us-a-wg-1", "1.1.1.1"), ("us-b-wg-2", "2.2.2.2"), ("us-c-wg-3", "3.3.3.3")]
+        ip_by_relay = dict(relays)
+        clean_relay = "us-b-wg-2"
+        current = {"server": None}
+
+        def fake_connect(server):
+            current["server"] = server
+            return True
+
+        def fake_detect():
+            s = current["server"]
+            flagged = s != clean_relay
+            return (ip_by_relay[s], {"is_vpn": flagged, "is_proxy": False})
+
+        with mock.patch.object(va, "list_relays", return_value=[r for r, _ in relays]), \
+             mock.patch.object(va, "list_relays_with_ips", return_value=relays), \
+             mock.patch.object(va, "ping_relays", return_value=_mock_ping_sort(*relays)), \
+             mock.patch.object(va, "connect_to_server", side_effect=fake_connect), \
              mock.patch.object(va, "verify_connection", return_value=True), \
-             mock.patch.object(va, "detection_flags", side_effect=[
-                 ("1.1.1.1", {"is_vpn": True, "is_proxy": False}),    # flagged -> keep going
-                 ("2.2.2.2", {"is_vpn": False, "is_proxy": False}),   # clean  -> stop here
-             ]) as detect, \
+             mock.patch.object(va, "detection_flags", side_effect=fake_detect), \
              mock.patch.object(va, "disconnect") as disconnect, \
              mock.patch("builtins.print"):
             va.main()
-        self.assertEqual(connect.call_count, 2)   # third relay never tried
-        self.assertEqual(detect.call_count, 2)
-        disconnect.assert_not_called()            # stays connected to the clean relay
+        self.assertEqual(current["server"], clean_relay)  # settled on the clean relay
+        disconnect.assert_not_called()                     # and stayed connected
 
     def test_no_clean_relay_disconnects_at_end(self):
         with mock.patch.object(va, "list_relays", return_value=["us-a-wg-1", "us-b-wg-2"]), \
@@ -354,11 +363,11 @@ class TestRotate(unittest.TestCase):
             va.rotate(skip={"us-a-wg-1", "us-b-wg-2"})
         self.assertEqual(seen, ["us-c-wg-3"])  # only the un-skipped one was tried
 
-    def test_walks_in_ping_sorted_order_not_input_order(self):
-        # Verify that rotate() respects the ping_relays sort order, not the
-        # raw list_relays_with_ips order. ping_relays returns the SLOWEST
-        # first here (descending), so connect_to_server should see them
-        # in that exact reversed order.
+    def test_walks_all_viable_relays_in_random_order(self):
+        # rotate() must (a) shuffle the viable list — NOT walk nearest-first,
+        # which would triangulate our location / make the pattern predictable —
+        # and (b) still cover every viable relay. We patch random.shuffle to a
+        # no-op so we can assert it's wired in, and check all relays get visited.
         seen = []
         def fake_connect(server):
             seen.append(server)
@@ -371,9 +380,11 @@ class TestRotate(unittest.TestCase):
                  ("us-b-wg-2", "2.2.2.2", 80.0),
              ]), \
              mock.patch.object(va, "connect_to_server", side_effect=fake_connect), \
+             mock.patch.object(va.random, "shuffle") as shuf, \
              mock.patch.object(va, "disconnect"):
             va.rotate()
-        self.assertEqual(seen, ["us-c-wg-3", "us-a-wg-1", "us-b-wg-2"])
+        shuf.assert_called_once()  # randomization is actually applied
+        self.assertEqual(set(seen), {"us-a-wg-1", "us-b-wg-2", "us-c-wg-3"})  # all covered
 
     def test_country_kwarg_passed_through_to_list_relays_with_ips(self):
         with mock.patch.object(va, "list_relays_with_ips", return_value=[]) as lr, \
