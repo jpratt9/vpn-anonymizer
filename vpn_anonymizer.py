@@ -18,6 +18,7 @@ import argparse
 import concurrent.futures
 import json
 import logging
+import os
 import random
 import re
 import subprocess
@@ -30,7 +31,10 @@ logger = logging.getLogger(__name__)
 # RTT or packet loss is technically reachable but useless for any real workload
 # — reject it and try the next one.
 _PING_COUNT = 5             # packets to send (need >2 for meaningful stats)
-_MAX_AVG_LATENCY_MS = 200   # reject relays whose average RTT exceeds this
+_MAX_AVG_LATENCY_MS = 200   # reject relays whose average RTT exceeds this (wired)
+_WIFI_MAX_AVG_LATENCY_MS = 350  # looser ceiling on Wi-Fi: WiFi RTT + jitter
+                                # routinely pushes VPN ping past the 200ms wired
+                                # bar even on usable relays (see _link_is_wifi).
 _MAX_PACKET_LOSS_PCT = 20   # reject relays losing more than this fraction
 
 # Pre-connect ping filter — used by rotate() to sort relays by latency BEFORE
@@ -205,9 +209,79 @@ def _parse_ping_stats(output):
     return avg_ms, loss_pct
 
 
+def _default_route_iface_macos():
+    """Interface name carrying the default route on macOS (e.g. 'en0'), or None."""
+    out = subprocess.run(
+        ["route", "-n", "get", "default"],
+        capture_output=True, text=True, timeout=5,
+    ).stdout
+    m = re.search(r"interface:\s*(\S+)", out)
+    return m.group(1) if m else None
+
+
+def _link_is_wifi():
+    """Best-effort detection of whether the default-route link is Wi-Fi.
+
+    Returns True (Wi-Fi), False (wired Ethernet), or None (couldn't tell). Used
+    to loosen the verify_connection latency ceiling on Wi-Fi, where RTT + jitter
+    routinely exceed the wired bar even for perfectly usable relays. Detection is
+    best-effort and NEVER raises — on any error it returns None, which callers
+    treat as "give it the benefit of the doubt" (i.e. the looser ceiling)."""
+    try:
+        if sys.platform == "darwin":
+            iface = _default_route_iface_macos()
+            if not iface:
+                return None
+            ports = subprocess.run(
+                ["networksetup", "-listallhardwareports"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            current_port = None
+            for line in ports.splitlines():
+                line = line.strip()
+                if line.startswith("Hardware Port:"):
+                    current_port = line.split(":", 1)[1].strip()
+                elif line.startswith("Device:") and current_port:
+                    if line.split(":", 1)[1].strip() == iface:
+                        p = current_port.lower()
+                        return "wi-fi" in p or "airport" in p
+            return None
+        if sys.platform == "win32":
+            # PhysicalMediaType of the adapter carrying the default route:
+            # 'Native802_11' = Wi-Fi, '802.3' = wired Ethernet.
+            ps = (
+                "$i = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | "
+                "Sort-Object RouteMetric | Select-Object -First 1 "
+                "-ExpandProperty InterfaceIndex; "
+                "(Get-NetAdapter -InterfaceIndex $i).PhysicalMediaType"
+            )
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                capture_output=True, text=True, timeout=10,
+            ).stdout.strip().lower()
+            if "802_11" in out or "wireless" in out:
+                return True
+            if "802.3" in out or "ethernet" in out:
+                return False
+            return None
+        if sys.platform.startswith("linux"):
+            out = subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            m = re.search(r"\bdev\s+(\S+)", out)
+            if not m:
+                return None
+            return os.path.isdir(f"/sys/class/net/{m.group(1)}/wireless")
+    except Exception as exc:  # best-effort; never break verify_connection
+        logger.debug("link-type detection failed: %s", exc)
+    return None
+
+
 def verify_connection(host="google.com"):
     """Ping `host` through the tunnel to confirm the relay is (a) reachable,
-    (b) reasonably fast (avg RTT <= _MAX_AVG_LATENCY_MS), and (c) not dropping
+    (b) reasonably fast (avg RTT within the latency ceiling: 200ms wired, 350ms
+    on Wi-Fi via _link_is_wifi), and (c) not dropping
     packets (loss <= _MAX_PACKET_LOSS_PCT). Returns True iff all three hold.
     The numbers actually measured get logged so a caller can see why a relay
     was rejected. (Extends clip_fixer's binary-pass/fail check with parsing.)
@@ -231,9 +305,15 @@ def verify_connection(host="google.com"):
     logger.info("  ping: avg=%s ms, loss=%s%%",
                 f"{avg_ms:.1f}" if avg_ms is not None else "?",
                 f"{loss_pct:.1f}" if loss_pct is not None else "?")
-    if avg_ms is not None and avg_ms > _MAX_AVG_LATENCY_MS:
-        logger.info("  rejecting: avg latency %.1fms > %dms threshold",
-                    avg_ms, _MAX_AVG_LATENCY_MS)
+    wifi = _link_is_wifi()
+    # Strict wired ceiling only when we're confident the link is Ethernet; Wi-Fi
+    # (or an undetectable link) gets the looser ceiling so normal WiFi jitter
+    # doesn't reject otherwise-usable relays.
+    max_latency = _MAX_AVG_LATENCY_MS if wifi is False else _WIFI_MAX_AVG_LATENCY_MS
+    link = {True: "wifi", False: "ethernet", None: "unknown"}[wifi]
+    if avg_ms is not None and avg_ms > max_latency:
+        logger.info("  rejecting: avg latency %.1fms > %dms threshold (%s link)",
+                    avg_ms, max_latency, link)
         return False
     if loss_pct is not None and loss_pct > _MAX_PACKET_LOSS_PCT:
         logger.info("  rejecting: packet loss %.1f%% > %d%% threshold",

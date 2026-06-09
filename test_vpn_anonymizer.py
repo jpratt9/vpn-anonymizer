@@ -105,6 +105,13 @@ class TestParsePingStats(unittest.TestCase):
 
 
 class TestVerifyConnection(unittest.TestCase):
+    def setUp(self):
+        # These cases assert the WIRED (200ms) behavior, so force Ethernet and
+        # keep link detection from shelling out / hitting the ping mock.
+        p = mock.patch.object(va, "_link_is_wifi", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+
     def _patch_run(self, stdout, returncode=0):
         return mock.patch.object(
             va.subprocess, "run",
@@ -140,6 +147,98 @@ class TestVerifyConnection(unittest.TestCase):
         # we fall back to trusting the exit code — same as the old behavior.
         with self._patch_run("garbage output"):
             self.assertTrue(va.verify_connection())
+
+
+_MACOS_PING_300 = _MACOS_PING_OK.replace(
+    "round-trip min/avg/max/stddev = 11.234/12.038/13.111/0.620 ms",
+    "round-trip min/avg/max/stddev = 280.000/300.000/330.000/20.000 ms",
+)
+_MACOS_PING_420 = _MACOS_PING_OK.replace(
+    "round-trip min/avg/max/stddev = 11.234/12.038/13.111/0.620 ms",
+    "round-trip min/avg/max/stddev = 400.000/420.000/450.000/20.000 ms",
+)
+
+
+class TestVerifyConnectionWifi(unittest.TestCase):
+    def setUp(self):
+        p = mock.patch.object(va, "_link_is_wifi", return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _patch_run(self, stdout, returncode=0):
+        return mock.patch.object(
+            va.subprocess, "run",
+            return_value=fake_proc(stdout=stdout, returncode=returncode),
+        )
+
+    def test_300ms_accepted_on_wifi(self):
+        # 300ms is rejected on Ethernet (>200) but passes the 350ms WiFi ceiling.
+        with self._patch_run(_MACOS_PING_300):
+            self.assertTrue(va.verify_connection())
+
+    def test_420ms_rejected_even_on_wifi(self):
+        with self._patch_run(_MACOS_PING_420):
+            self.assertFalse(va.verify_connection())
+
+
+class TestVerifyThresholdByLink(unittest.TestCase):
+    """Same 300ms relay: rejected on Ethernet, accepted on Wi-Fi/unknown."""
+    def _patch_run(self, stdout):
+        return mock.patch.object(
+            va.subprocess, "run",
+            return_value=fake_proc(stdout=stdout, returncode=0),
+        )
+
+    def test_ethernet_rejects_300ms(self):
+        with mock.patch.object(va, "_link_is_wifi", return_value=False), \
+             self._patch_run(_MACOS_PING_300):
+            self.assertFalse(va.verify_connection())
+
+    def test_unknown_link_uses_loose_ceiling(self):
+        with mock.patch.object(va, "_link_is_wifi", return_value=None), \
+             self._patch_run(_MACOS_PING_300):
+            self.assertTrue(va.verify_connection())
+
+
+class TestLinkIsWifi(unittest.TestCase):
+    def test_macos_wifi(self):
+        route_out = "   gateway: 192.168.1.1\n  interface: en0\n"
+        ports_out = (
+            "Hardware Port: Wi-Fi\nDevice: en0\nEthernet Address: a:b\n\n"
+            "Hardware Port: Ethernet\nDevice: en5\n"
+        )
+        with mock.patch.object(va.sys, "platform", "darwin"), \
+             mock.patch.object(va.subprocess, "run", side_effect=[
+                 fake_proc(stdout=route_out), fake_proc(stdout=ports_out)]):
+            self.assertIs(va._link_is_wifi(), True)
+
+    def test_macos_ethernet(self):
+        route_out = "  interface: en5\n"
+        ports_out = (
+            "Hardware Port: Wi-Fi\nDevice: en0\n\n"
+            "Hardware Port: Ethernet\nDevice: en5\n"
+        )
+        with mock.patch.object(va.sys, "platform", "darwin"), \
+             mock.patch.object(va.subprocess, "run", side_effect=[
+                 fake_proc(stdout=route_out), fake_proc(stdout=ports_out)]):
+            self.assertIs(va._link_is_wifi(), False)
+
+    def test_windows_wifi(self):
+        with mock.patch.object(va.sys, "platform", "win32"), \
+             mock.patch.object(va.subprocess, "run",
+                               return_value=fake_proc(stdout="Native802_11\n")):
+            self.assertIs(va._link_is_wifi(), True)
+
+    def test_windows_ethernet(self):
+        with mock.patch.object(va.sys, "platform", "win32"), \
+             mock.patch.object(va.subprocess, "run",
+                               return_value=fake_proc(stdout="802.3\n")):
+            self.assertIs(va._link_is_wifi(), False)
+
+    def test_detection_error_returns_none(self):
+        with mock.patch.object(va.sys, "platform", "darwin"), \
+             mock.patch.object(va.subprocess, "run", side_effect=OSError("boom")):
+            self.assertIsNone(va._link_is_wifi())
 
 
 class TestDetectionFlags(unittest.TestCase):
@@ -398,6 +497,13 @@ class TestPingIp(unittest.TestCase):
 
 
 class TestVerifyConnectionHost(unittest.TestCase):
+    def setUp(self):
+        # Stub link detection so the ping is the only subprocess.run call and
+        # run.call_args reflects the ping command (not _link_is_wifi's probes).
+        p = mock.patch.object(va, "_link_is_wifi", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_default_host_is_google_dot_com(self):
         out = ("PING google.com (1.1.1.1): 56 data bytes\n"
                "round-trip min/avg/max/stddev = 5.0/5.0/5.0/0.0 ms\n"
