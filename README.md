@@ -1,12 +1,10 @@
 # VPN Anonymizer
 
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/prattsolutions)
-
 > A small tool for staying in touch with loved ones during periods of internet
 > censorship or surveillance — cycles through Mullvad's US WireGuard relays
 > until you find a clean exit IP that isn't flagged as VPN / proxy.
 
-[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0) [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/prattsolutions)
 
 Cycles through Mullvad WireGuard relays, connects to each, **measures latency
 and packet loss** through the tunnel, and checks whether that exit IP is
